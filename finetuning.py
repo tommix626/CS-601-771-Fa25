@@ -82,28 +82,63 @@ def plot_curves(train_acc: List[float], dev_acc: List[float], title: str, outfil
 # -------------------------------
 def load_text_classification(dataset_name: str, seed: int, tokenizer, max_len: int = 128):
     """
-    Loads StrategyQA (default) and creates train/dev/test splits.
+    Loads StrategyQA and creates train/dev/test splits.
     """
     if dataset_name == "strategyqa":
-        # Note: wics/strategy-qa exposes a single 'test' split; we re-split it into train/dev/test.
-        # Samples have fields like: {'question': str, 'answer': bool, ...}
-        ds = load_dataset("wics/strategy-qa")
-        base = ds["test"]
-        tmp = base.train_test_split(test_size=0.2, seed=seed)  # 80% temp-train, 20% test
-        temp_train, test_ds = tmp["train"], tmp["test"]
-        split2 = temp_train.train_test_split(test_size=0.2, seed=seed)  # 80/20 -> train/dev
-        train_ds, dev_ds = split2["train"], split2["test"]
-        num_labels = 2
-        text_col = "question"
+        # IMPORTANT for HF Datasets v3: allow remote dataset code execution
+        ds = load_dataset("wics/strategy-qa", trust_remote_code=True)
 
-        # map boolean answers to {0,1}
+        # StrategyQA repos vary; handle several layouts robustly.
+        # Prefer existing splits; otherwise derive them from a single available split.
+        if all(k in ds for k in ("train", "validation", "test")):
+            base_train, dev_ds, test_ds = ds["train"], ds["validation"], ds["test"]
+        elif "train" in ds and "validation" in ds:
+            base_train, dev_ds = ds["train"], ds["validation"]
+            # derive test from a slice of train to keep a held-out set
+            tmp = base_train.train_test_split(test_size=0.2, seed=seed)
+            base_train, test_ds = tmp["train"], tmp["test"]
+        elif "train" in ds:
+            # only train provided → split into train/dev/test = 64/16/20
+            tmp = ds["train"].train_test_split(test_size=0.2, seed=seed)   # 80% temp-train, 20% test
+            temp_train, test_ds = tmp["train"], tmp["test"]
+            split2 = temp_train.train_test_split(test_size=0.2, seed=seed) # 80→(64/16)
+            base_train, dev_ds = split2["train"], split2["test"]
+        elif "test" in ds:
+            # some mirrors only expose 'test' → reuse as pool, then split
+            tmp = ds["test"].train_test_split(test_size=0.2, seed=seed)
+            temp_train, test_ds = tmp["train"], tmp["test"]
+            split2 = temp_train.train_test_split(test_size=0.2, seed=seed)
+            base_train, dev_ds = split2["train"], split2["test"]
+        else:
+            raise RuntimeError("StrategyQA: unexpected split layout.")
+
+        num_labels = 2
+        text_col_candidates = ["question", "input", "text"]
+
+        def _pick_text_col(example):
+            for c in text_col_candidates:
+                if c in example:
+                    return c
+            raise KeyError("No suitable text field found in StrategyQA example.")
+
+        # Determine text column once from a sample
+        sample = next(iter(base_train))
+        text_col = _pick_text_col(sample)
+
+        # Map labels → integer {0,1}
         def _label_map(ex):
-            ex["labels"] = 1 if bool(ex.get("answer", False)) else 0
+            if "answer" in ex:
+                ex["labels"] = 1 if bool(ex["answer"]) else 0
+            elif "label" in ex:
+                # some variants use 'label' already as 0/1
+                ex["labels"] = int(ex["label"])
+            else:
+                raise KeyError("StrategyQA: no 'answer' or 'label' field present.")
             return ex
 
-        train_ds = train_ds.map(_label_map)
-        dev_ds = dev_ds.map(_label_map)
-        test_ds = test_ds.map(_label_map)
+        train_ds = base_train.map(_label_map)
+        dev_ds   = dev_ds.map(_label_map)
+        test_ds  = test_ds.map(_label_map)
     else:
         raise ValueError("Unsupported dataset. Use --dataset strategyqa")
 
@@ -114,7 +149,7 @@ def load_text_classification(dataset_name: str, seed: int, tokenizer, max_len: i
             padding=False,
             max_length=max_len,
         )
-        # 'labels' already set for StrategyQA above
+        # labels already set by _label_map
         return enc
 
     train_ds = train_ds.map(tokenize_fn, batched=True, remove_columns=train_ds.column_names)

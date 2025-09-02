@@ -146,7 +146,9 @@ def load_text_classification(dataset_name: str, seed: int, tokenizer, max_len: i
             padding=False,
             max_length=max_len,
         )
-        # labels already set by _label_map
+        # Preserve labels set by _label_map so the collator includes them
+        if "labels" in ex:
+            enc["labels"] = ex["labels"]
         return enc
 
     train_ds = train_ds.map(tokenize_fn, batched=True, remove_columns=train_ds.column_names)

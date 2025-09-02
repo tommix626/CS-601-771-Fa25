@@ -28,7 +28,9 @@ import argparse
 import math
 import os
 from dataclasses import dataclass
+from contextlib import contextmanager
 from typing import Dict, List, Tuple
+import tempfile
 
 import numpy as np
 import torch
@@ -85,8 +87,26 @@ def load_text_classification(dataset_name: str, seed: int, tokenizer, max_len: i
     Loads StrategyQA and creates train/dev/test splits.
     """
     if dataset_name == "strategyqa":
-        # IMPORTANT for HF Datasets v3: allow remote dataset code execution
-        ds = load_dataset("wics/strategy-qa", trust_remote_code=True)
+        # If a local dataset script named 'strategy-qa.py' is present, Datasets v3 will error.
+        # Work around by loading from a clean temporary directory.
+        needs_isolation = os.path.exists("strategy-qa.py")
+
+        @contextmanager
+        def _isolated_cwd():
+            if not needs_isolation:
+                yield
+                return
+            prev = os.getcwd()
+            with tempfile.TemporaryDirectory() as tmpdir:
+                os.chdir(tmpdir)
+                try:
+                    yield
+                finally:
+                    os.chdir(prev)
+
+        with _isolated_cwd():
+            # IMPORTANT for HF Datasets v3: allow remote dataset code execution
+            ds = load_dataset("wics/strategy-qa", trust_remote_code=True)
 
         # StrategyQA repos vary; handle several layouts robustly.
         # Prefer existing splits; otherwise derive them from a single available split.
@@ -149,7 +169,9 @@ def load_text_classification(dataset_name: str, seed: int, tokenizer, max_len: i
             padding=False,
             max_length=max_len,
         )
-        # labels already set by _label_map
+        # Preserve labels set by _label_map so the collator includes them
+        if "labels" in ex:
+            enc["labels"] = ex["labels"]
         return enc
 
     train_ds = train_ds.map(tokenize_fn, batched=True, remove_columns=train_ds.column_names)

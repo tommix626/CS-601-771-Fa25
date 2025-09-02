@@ -1,29 +1,3 @@
-#!/usr/bin/env python3
-"""
-Empirical: Building a Head-Tuned Classifier and a LoRA Classifier on ModernBERT
-
-What this script does (no interpretation prints):
-1) Loads the StrategyQA dataset from Hugging Face and builds train/dev/test splits.
-2) Trains two models:
-   (4.1) HEAD-ONLY: Freeze ModernBERT and train only the classification head.
-   (4.2) LoRA: Freeze ModernBERT + classifier; add LoRA on a small subset of Linear layers.
-        LoRA rank and target subset are chosen automatically to closely match the number of
-        trainable parameters in (4.1). The final counts are written to the LaTeX table.
-
-3) Tracks train/dev accuracy per epoch and saves two plots:
-   - head_acc.png
-   - lora_acc.png
-
-4) Selects the best epoch by dev accuracy for each method, evaluates on test, and prints
-   concise results showing trainable parameters, validation accuracy, and test accuracy.
-
-Requirements:
-    pip install -U torch torchvision torchaudio
-    pip install -U transformers datasets peft matplotlib tqdm
-
-Default model (change via --model):
-    answerdotai/ModernBERT-base    (pass --model answerdotai/ModernBERT-small to train faster)
-"""
 import argparse
 import math
 import os
@@ -113,17 +87,20 @@ def load_text_classification(dataset_name: str, seed: int, tokenizer, max_len: i
         if all(k in ds for k in ("train", "validation", "test")):
             base_train, dev_ds, test_ds = ds["train"], ds["validation"], ds["test"]
         elif "train" in ds and "validation" in ds:
+            print("train and validation in ds")
             base_train, dev_ds = ds["train"], ds["validation"]
             # derive test from a slice of train to keep a held-out set
             tmp = base_train.train_test_split(test_size=0.2, seed=seed)
             base_train, test_ds = tmp["train"], tmp["test"]
         elif "train" in ds:
+            print("train in ds")
             # only train provided → split into train/dev/test = 64/16/20
             tmp = ds["train"].train_test_split(test_size=0.2, seed=seed)   # 80% temp-train, 20% test
             temp_train, test_ds = tmp["train"], tmp["test"]
             split2 = temp_train.train_test_split(test_size=0.2, seed=seed) # 80→(64/16)
             base_train, dev_ds = split2["train"], split2["test"]
         elif "test" in ds:
+            print("test in ds")
             # some mirrors only expose 'test' → reuse as pool, then split
             tmp = ds["test"].train_test_split(test_size=0.2, seed=seed)
             temp_train, test_ds = tmp["train"], tmp["test"]
@@ -169,9 +146,7 @@ def load_text_classification(dataset_name: str, seed: int, tokenizer, max_len: i
             padding=False,
             max_length=max_len,
         )
-        # Preserve labels set by _label_map so the collator includes them
-        if "labels" in ex:
-            enc["labels"] = ex["labels"]
+        # labels already set by _label_map
         return enc
 
     train_ds = train_ds.map(tokenize_fn, batched=True, remove_columns=train_ds.column_names)
@@ -333,6 +308,8 @@ def pick_lora_targets_close_to_budget(model: nn.Module, budget_params: int) -> T
 
     chosen = [best_name] if best_name is not None else []
     r = 1
+    print(f"Chosen targets: {chosen}, r: {r}")
+    print(f"Best delta: {best_delta}, best cost: {best_cost}")
     return chosen, r
 
 

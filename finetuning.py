@@ -430,8 +430,10 @@ def main():
     plot_curves(lora_res.train_curve, lora_res.dev_curve, f"LoRA (StrategyQA) (targets={targets}, r={r}): accuracy", "plots/lora_acc.png")
 
     # Print results
+    head_classifier_cost = count_classifier_head_params(head_model)
     print_results(
         head_params=head_res.trainable_params,
+        head_classifier_cost=head_classifier_cost,
         head_best_dev=head_res.best_dev_acc,
         head_test=head_res.test_acc,
         lora_params=lora_res.trainable_params,

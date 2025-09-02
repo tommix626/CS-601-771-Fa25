@@ -308,7 +308,7 @@ def save_plots(all_results: List[Dict], outdir: str):
     plt.figure(figsize=(7,5))
     for dev in devs:
         xs, ys, es = series("time_ms_mean", "time_ms_se", dev)
-        plt.errorbar(xs, ys, yerr=es, marker="o", capsize=3, label=dev.upper())
+        plt.errorbar(xs, ys, yerr=es, marker="o", capsize=3, markersize=4, label=dev.upper())
     plt.xscale("log"); plt.yscale("log")
     plt.xlabel("Sequence length L (log)")
     plt.ylabel("Forward time (ms, log)")
@@ -323,7 +323,7 @@ def save_plots(all_results: List[Dict], outdir: str):
     plt.figure(figsize=(7,5))
     for dev in devs:
         xs, ys, es = series("mem_bytes_mean", "mem_bytes_se", dev)
-        plt.errorbar(xs, ys, yerr=es, marker="o", capsize=3, label=dev.upper())
+        plt.errorbar(xs, ys, yerr=es, marker="o", capsize=3, markersize=4, label=dev.upper())
     plt.xscale("log"); plt.yscale("log")
     plt.xlabel("Sequence length L (log)")
     plt.ylabel("Peak memory (Bytes, log)")
@@ -339,7 +339,7 @@ def save_plots(all_results: List[Dict], outdir: str):
     for dev in devs:
         xs, ys, _ = series("est_flops", "est_flops", dev)
         ys = [y for y in ys]  # just counts
-        plt.plot(xs, ys, marker="o", label=f"{dev.upper()} (same counts)")
+        plt.plot(xs, ys, marker="o", markersize=4, label=f"{dev.upper()} (same counts)")
     plt.xscale("log"); plt.yscale("log")
     plt.xlabel("Sequence length L (log)")
     plt.ylabel("FLOPs per forward (log)")
@@ -354,7 +354,7 @@ def save_plots(all_results: List[Dict], outdir: str):
     plt.figure(figsize=(7,5))
     for dev in devs:
         xs, ys, es = series("achieved_gflops_s_mean", "achieved_gflops_s_se", dev)
-        plt.errorbar(xs, ys, yerr=es, marker="o", capsize=3, label=dev.upper())
+        plt.errorbar(xs, ys, yerr=es, marker="o", capsize=3, markersize=4, label=dev.upper())
     plt.xscale("log")
     plt.xlabel("Sequence length L (log)")
     plt.ylabel("Achieved throughput (GFLOP/s)")

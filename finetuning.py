@@ -192,8 +192,8 @@ def train_model(
     best_path = out_path
 
     for ep in range(1, epochs + 1):
-        _, train_acc = run_one_epoch(model, train_loader, device, optimizer=optimizer, desc=f"Epoch {ep}/{} - Train".format(epochs))
-        _, dev_acc = run_one_epoch(model, dev_loader, device, optimizer=None, desc=f"Epoch {ep}/{} - Val".format(epochs))
+        _, train_acc = run_one_epoch(model, train_loader, device, optimizer=optimizer, desc=f"Epoch {ep}/{epochs} - Train")
+        _, dev_acc = run_one_epoch(model, dev_loader, device, optimizer=None, desc=f"Epoch {ep}/{epochs} - Val")
         train_curve.append(train_acc)
         dev_curve.append(dev_acc)
         

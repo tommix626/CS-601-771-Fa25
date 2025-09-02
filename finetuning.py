@@ -89,7 +89,7 @@ def load_text_classification(dataset_name: str, seed: int, tokenizer, max_len: i
         text_col = "text"
         label_col = "label"
         # Split train into train/dev
-        split = ds["train"].train_test_split(test_size=0.1, seed=seed)
+        split = ds["train"].train_test_split(test_size=0.2, seed=seed)
         train_ds, dev_ds = split["train"], split["test"]
         test_ds = ds["test"]
     elif dataset_name == "sst2":
@@ -97,7 +97,7 @@ def load_text_classification(dataset_name: str, seed: int, tokenizer, max_len: i
         num_labels = 2
         text_col = "sentence"
         label_col = "label"
-        split = ds["train"].train_test_split(test_size=0.1, seed=seed)
+        split = ds["train"].train_test_split(test_size=0.2, seed=seed)
         train_ds, dev_ds = split["train"], split["test"]
         test_ds = ds["validation"]
     else:
@@ -139,10 +139,10 @@ class TrainResult:
     trainable_params: int
     test_acc: float = float("nan")
 
-
+# core training loop
 def run_one_epoch(model, loader, device, optimizer=None):
     is_train = optimizer is not None
-    model.train(is_train)
+    model.train(is_train) 
     accs, losses = [], []
     loss_fn = nn.CrossEntropyLoss()
     for batch in loader:
@@ -217,6 +217,7 @@ def build_head_only_model(model_name: str, num_labels: int, device: torch.device
     for name, p in model.named_parameters():
         if "classifier" in name or name.endswith("score.weight") or name.endswith("score.bias"):
             p.requires_grad = True
+            print(f"Unfreezing {name}")
     return model
 
 

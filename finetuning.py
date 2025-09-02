@@ -38,6 +38,14 @@ def count_trainable_params(model: nn.Module) -> int:
     return sum(p.numel() for p in model.parameters() if p.requires_grad)
 
 
+def count_classifier_head_params(model: nn.Module) -> int:
+    total = 0
+    for name, p in model.named_parameters():
+        if "classifier" in name and p.requires_grad:
+            total += p.numel()
+    return total
+
+
 def plot_curves(train_acc: List[float], dev_acc: List[float], title: str, outfile: str):
     plt.figure(figsize=(5, 3.5), dpi=140)
     xs = np.arange(1, len(train_acc) + 1)
@@ -347,6 +355,7 @@ def build_lora_model_with_budget(model_name: str, num_labels: int, device: torch
 # -------------------------------
 def print_results(
     head_params: int,
+    head_classifier_cost: int,
     head_best_dev: float,
     head_test: float,
     lora_params: int,
@@ -361,6 +370,7 @@ def print_results(
     print("="*60)
     print(f"Head-only:")
     print(f"  Trainable Parameters: {head_params:,}")
+    print(f"  Head tuning cost:    {head_classifier_cost:,}")
     print(f"  Best Validation Acc:  {head_best_dev:.4f}")
     print(f"  Test Accuracy:        {head_test:.4f}")
     print()

@@ -19,7 +19,7 @@ What this script does (no interpretation prints):
 
 Requirements:
     pip install -U torch torchvision torchaudio
-    pip install -U transformers datasets peft matplotlib
+    pip install -U transformers datasets peft matplotlib tqdm
 
 Default model (change via --model):
     answerdotai/ModernBERT-base    (pass --model answerdotai/ModernBERT-small to train faster)
@@ -39,6 +39,7 @@ from transformers import AutoTokenizer, AutoModelForSequenceClassification
 from transformers import DataCollatorWithPadding, set_seed
 from peft import LoraConfig, get_peft_model
 import matplotlib.pyplot as plt
+from tqdm import tqdm
 
 
 # -------------------------------
@@ -140,12 +141,15 @@ class TrainResult:
     test_acc: float = float("nan")
 
 # core training loop
-def run_one_epoch(model, loader, device, optimizer=None):
+def run_one_epoch(model, loader, device, optimizer=None, desc="Epoch"):
     is_train = optimizer is not None
     model.train(is_train) 
     accs, losses = [], []
     loss_fn = nn.CrossEntropyLoss()
-    for batch in loader:
+    
+    # Add progress bar
+    pbar = tqdm(loader, desc=desc, leave=False)
+    for batch in pbar:
         input_ids = batch["input_ids"].to(device)
         attention_mask = batch["attention_mask"].to(device)
         labels = batch["labels"].to(device)
@@ -161,6 +165,15 @@ def run_one_epoch(model, loader, device, optimizer=None):
 
         losses.append(loss.item())
         accs.append(accuracy_from_logits(logits.detach(), labels))
+        
+        # Update progress bar with current metrics
+        current_loss = np.mean(losses)
+        current_acc = np.mean(accs)
+        pbar.set_postfix({
+            'loss': f'{current_loss:.4f}',
+            'acc': f'{current_acc:.4f}'
+        })
+    
     return float(np.mean(losses)), float(np.mean(accs))
 
 
@@ -179,14 +192,18 @@ def train_model(
     best_path = out_path
 
     for ep in range(1, epochs + 1):
-        _, train_acc = run_one_epoch(model, train_loader, device, optimizer=optimizer)
-        _, dev_acc = run_one_epoch(model, dev_loader, device, optimizer=None)
+        _, train_acc = run_one_epoch(model, train_loader, device, optimizer=optimizer, desc=f"Epoch {ep}/{} - Train".format(epochs))
+        _, dev_acc = run_one_epoch(model, dev_loader, device, optimizer=None, desc=f"Epoch {ep}/{} - Val".format(epochs))
         train_curve.append(train_acc)
         dev_curve.append(dev_acc)
+        
+        print(f"Epoch {ep}: Train Acc = {train_acc:.4f}, Dev Acc = {dev_acc:.4f}")
+        
         if dev_acc > best_dev:
             best_dev = dev_acc
             best_epoch = ep
             torch.save(model.state_dict(), best_path)
+            print(f"  -> New best dev accuracy! Saving checkpoint.")
 
     return TrainResult(
         train_curve=train_curve,
@@ -201,7 +218,7 @@ def train_model(
 def evaluate_best(model: nn.Module, ckpt_path: str, test_loader: DataLoader, device: torch.device) -> float:
     state = torch.load(ckpt_path, map_location=device)
     model.load_state_dict(state)
-    _, test_acc = run_one_epoch(model, test_loader, device, optimizer=None)
+    _, test_acc = run_one_epoch(model, test_loader, device, optimizer=None, desc="Evaluating on test set")
     return test_acc
 
 
@@ -339,6 +356,9 @@ def main():
     )
 
     # (4.1) Head-only training
+    print("\n" + "="*60)
+    print("TRAINING HEAD-ONLY MODEL")
+    print("="*60)
     head_model = build_head_only_model(args.model, num_labels, device)
     head_res = train_model(
         head_model, train_loader, dev_loader, device, epochs=args.epochs, lr=args.lr_head, out_path="head_best.pt"
@@ -348,6 +368,9 @@ def main():
     plot_curves(head_res.train_curve, head_res.dev_curve, "Head-only: accuracy", "head_acc.png")
 
     # (4.2) LoRA training with parameter budget ~ head-only
+    print("\n" + "="*60)
+    print("TRAINING LoRA MODEL")
+    print("="*60)
     head_budget = head_res.trainable_params
     lora_model, targets, r = build_lora_model_with_budget(args.model, num_labels, device, head_budget)
     lora_res = train_model(

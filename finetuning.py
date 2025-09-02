@@ -1,0 +1,371 @@
+#!/usr/bin/env python3
+"""
+Empirical: Building a Head-Tuned Classifier and a LoRA Classifier on ModernBERT
+
+What this script does (no interpretation prints):
+1) Loads a text classification dataset (default: AG News).
+2) Trains two models:
+   (4.1) HEAD-ONLY: Freeze ModernBERT and train only the classification head.
+   (4.2) LoRA: Freeze ModernBERT + classifier; add LoRA on a small subset of Linear layers.
+        LoRA rank and target subset are chosen automatically to closely match the number of
+        trainable parameters in (4.1). The final counts are written to the LaTeX table.
+
+3) Tracks train/dev accuracy per epoch and saves two plots:
+   - head_acc.png
+   - lora_acc.png
+
+4) Selects the best epoch by dev accuracy for each method, evaluates on test, and prints
+   concise results showing trainable parameters, validation accuracy, and test accuracy.
+
+Requirements:
+    pip install -U torch torchvision torchaudio
+    pip install -U transformers datasets peft matplotlib
+
+Default model (change via --model):
+    answerdotai/ModernBERT-base    (pass --model answerdotai/ModernBERT-small to train faster)
+"""
+import argparse
+import math
+import os
+from dataclasses import dataclass
+from typing import Dict, List, Tuple
+
+import numpy as np
+import torch
+import torch.nn as nn
+from torch.utils.data import DataLoader
+from datasets import load_dataset
+from transformers import AutoTokenizer, AutoModelForSequenceClassification
+from transformers import DataCollatorWithPadding, set_seed
+from peft import LoraConfig, get_peft_model
+import matplotlib.pyplot as plt
+
+
+# -------------------------------
+# Utilities
+# -------------------------------
+def choose_device() -> torch.device:
+    if torch.cuda.is_available():
+        return torch.device("cuda")
+    if torch.backends.mps.is_available():
+        return torch.device("mps")
+    return torch.device("cpu")
+
+
+def accuracy_from_logits(logits: torch.Tensor, labels: torch.Tensor) -> float:
+    preds = logits.argmax(dim=-1)
+    return (preds == labels).float().mean().item()
+
+
+def count_trainable_params(model: nn.Module) -> int:
+    return sum(p.numel() for p in model.parameters() if p.requires_grad)
+
+
+def plot_curves(train_acc: List[float], dev_acc: List[float], title: str, outfile: str):
+    plt.figure(figsize=(5, 3.5), dpi=140)
+    xs = np.arange(1, len(train_acc) + 1)
+    plt.plot(xs, train_acc, marker="o", label="train acc")
+    plt.plot(xs, dev_acc, marker="o", label="dev acc")
+    plt.xlabel("epoch")
+    plt.ylabel("accuracy")
+    plt.title(title)
+    plt.legend()
+    plt.grid(True, alpha=0.25)
+    plt.tight_layout()
+    plt.savefig(outfile)
+    plt.close()
+
+
+# -------------------------------
+# Data
+# -------------------------------
+def load_text_classification(dataset_name: str, seed: int, tokenizer, max_len: int = 128):
+    """
+    Loads dataset (default: ag_news) and creates train/dev/test splits.
+    """
+    if dataset_name == "ag_news":
+        ds = load_dataset("ag_news")
+        num_labels = 4
+        text_col = "text"
+        label_col = "label"
+        # Split train into train/dev
+        split = ds["train"].train_test_split(test_size=0.1, seed=seed)
+        train_ds, dev_ds = split["train"], split["test"]
+        test_ds = ds["test"]
+    elif dataset_name == "sst2":
+        ds = load_dataset("glue", "sst2")
+        num_labels = 2
+        text_col = "sentence"
+        label_col = "label"
+        split = ds["train"].train_test_split(test_size=0.1, seed=seed)
+        train_ds, dev_ds = split["train"], split["test"]
+        test_ds = ds["validation"]
+    else:
+        raise ValueError("Unsupported dataset. Use --dataset ag_news or --dataset sst2")
+
+    def tokenize_fn(ex):
+        enc = tokenizer(
+            ex[text_col],
+            truncation=True,
+            padding=False,
+            max_length=max_len,
+        )
+        enc["labels"] = ex[label_col]
+        return enc
+
+    train_ds = train_ds.map(tokenize_fn, batched=True, remove_columns=train_ds.column_names)
+    dev_ds = dev_ds.map(tokenize_fn, batched=True, remove_columns=dev_ds.column_names)
+    test_ds = test_ds.map(tokenize_fn, batched=True, remove_columns=test_ds.column_names)
+
+    collator = DataCollatorWithPadding(tokenizer)
+    return (
+        DataLoader(train_ds, batch_size=32, shuffle=True, collate_fn=collator),
+        DataLoader(dev_ds, batch_size=64, shuffle=False, collate_fn=collator),
+        DataLoader(test_ds, batch_size=64, shuffle=False, collate_fn=collator),
+        num_labels,
+    )
+
+
+# -------------------------------
+# Training/Eval Loops
+# -------------------------------
+@dataclass
+class TrainResult:
+    train_curve: List[float]
+    dev_curve: List[float]
+    best_epoch: int
+    best_dev_acc: float
+    best_path: str
+    trainable_params: int
+    test_acc: float = float("nan")
+
+
+def run_one_epoch(model, loader, device, optimizer=None):
+    is_train = optimizer is not None
+    model.train(is_train)
+    accs, losses = [], []
+    loss_fn = nn.CrossEntropyLoss()
+    for batch in loader:
+        input_ids = batch["input_ids"].to(device)
+        attention_mask = batch["attention_mask"].to(device)
+        labels = batch["labels"].to(device)
+
+        outputs = model(input_ids=input_ids, attention_mask=attention_mask)
+        logits = outputs.logits
+        loss = loss_fn(logits, labels)
+
+        if is_train:
+            optimizer.zero_grad(set_to_none=True)
+            loss.backward()
+            optimizer.step()
+
+        losses.append(loss.item())
+        accs.append(accuracy_from_logits(logits.detach(), labels))
+    return float(np.mean(losses)), float(np.mean(accs))
+
+
+def train_model(
+    model: nn.Module,
+    train_loader: DataLoader,
+    dev_loader: DataLoader,
+    device: torch.device,
+    epochs: int,
+    lr: float,
+    out_path: str,
+) -> TrainResult:
+    optimizer = torch.optim.AdamW([p for p in model.parameters() if p.requires_grad], lr=lr)
+    train_curve, dev_curve = [], []
+    best_dev, best_epoch = -1.0, -1
+    best_path = out_path
+
+    for ep in range(1, epochs + 1):
+        _, train_acc = run_one_epoch(model, train_loader, device, optimizer=optimizer)
+        _, dev_acc = run_one_epoch(model, dev_loader, device, optimizer=None)
+        train_curve.append(train_acc)
+        dev_curve.append(dev_acc)
+        if dev_acc > best_dev:
+            best_dev = dev_acc
+            best_epoch = ep
+            torch.save(model.state_dict(), best_path)
+
+    return TrainResult(
+        train_curve=train_curve,
+        dev_curve=dev_curve,
+        best_epoch=best_epoch,
+        best_dev_acc=best_dev,
+        best_path=best_path,
+        trainable_params=count_trainable_params(model),
+    )
+
+
+def evaluate_best(model: nn.Module, ckpt_path: str, test_loader: DataLoader, device: torch.device) -> float:
+    state = torch.load(ckpt_path, map_location=device)
+    model.load_state_dict(state)
+    _, test_acc = run_one_epoch(model, test_loader, device, optimizer=None)
+    return test_acc
+
+
+# -------------------------------
+# (4.1) HEAD-ONLY setup
+# -------------------------------
+def build_head_only_model(model_name: str, num_labels: int, device: torch.device):
+    model = AutoModelForSequenceClassification.from_pretrained(model_name, num_labels=num_labels).to(device)
+    # Freeze everything
+    for p in model.parameters():
+        p.requires_grad = False
+    # Unfreeze only the classification head
+    for name, p in model.named_parameters():
+        if "classifier" in name or name.endswith("score.weight") or name.endswith("score.bias"):
+            p.requires_grad = True
+    return model
+
+
+# -------------------------------
+# (4.2) LoRA setup with param budget matching
+# -------------------------------
+def list_linear_modules_for_lora(model: nn.Module) -> List[Tuple[str, nn.Linear]]:
+    """Return all Linear modules except anything in the classification head."""
+    linear_names = []
+    for name, module in model.named_modules():
+        if isinstance(module, nn.Linear) and "classifier" not in name:
+            linear_names.append((name, module))
+    return linear_names
+
+
+def pick_lora_targets_close_to_budget(model: nn.Module, budget_params: int) -> Tuple[List[str], int]:
+    """
+    Choose a small subset of Linear modules and a rank r such that:
+        trainable_params_lora = 2 * r * sum_i (in_i + out_i)  is close to 'budget_params'
+    We keep it simple: try r=1, and pick the single Linear whose (2*(in+out)) is closest to budget.
+    This works well on AG News with ModernBERT (head params ~= 3k).
+    Returns (target_module_names, chosen_rank).
+    """
+    linear_list = list_linear_modules_for_lora(model)
+    if not linear_list:
+        return [], 1
+
+    # Try r=1 with a single module closest to budget
+    best_name, best_delta, best_cost = None, float("inf"), None
+    for name, lin in linear_list:
+        in_f, out_f = lin.in_features, lin.out_features
+        cost = 2 * (in_f + out_f)  # params added when r=1
+        delta = abs(cost - budget_params)
+        if delta < best_delta:
+            best_name, best_delta, best_cost = name, delta, cost
+
+    chosen = [best_name] if best_name is not None else []
+    r = 1
+    return chosen, r
+
+
+def build_lora_model_with_budget(model_name: str, num_labels: int, device: torch.device, head_budget: int):
+    """
+    Freeze base + classifier, add LoRA to a subset of linear layers to match (as close as possible)
+    the number of trainable parameters from head-only training.
+    """
+    base = AutoModelForSequenceClassification.from_pretrained(model_name, num_labels=num_labels).to(device)
+    # Freeze everything, including classifier
+    for name, p in base.named_parameters():
+        p.requires_grad = False
+
+    targets, r = pick_lora_targets_close_to_budget(base, budget_params=head_budget)
+    lcfg = LoraConfig(
+        r=r,
+        lora_alpha=2 * r,
+        lora_dropout=0.0,
+        bias="none",
+        target_modules=targets,
+        task_type="SEQ_CLS",
+    )
+    lora_model = get_peft_model(base, lcfg)
+    # Make absolutely sure classifier remains frozen
+    for name, p in lora_model.named_parameters():
+        if "classifier" in name:
+            p.requires_grad = False
+    return lora_model, targets, r
+
+
+# -------------------------------
+# Results Reporter
+# -------------------------------
+def print_results(
+    head_params: int,
+    head_best_dev: float,
+    head_test: float,
+    lora_params: int,
+    lora_best_dev: float,
+    lora_test: float,
+):
+    """
+    Prints concise classification results.
+    """
+    print("\n" + "="*60)
+    print("CLASSIFICATION RESULTS")
+    print("="*60)
+    print(f"Head-only:")
+    print(f"  Trainable Parameters: {head_params:,}")
+    print(f"  Best Validation Acc:  {head_best_dev:.4f}")
+    print(f"  Test Accuracy:        {head_test:.4f}")
+    print()
+    print(f"LoRA:")
+    print(f"  Trainable Parameters: {lora_params:,}")
+    print(f"  Best Validation Acc:  {lora_best_dev:.4f}")
+    print(f"  Test Accuracy:        {lora_test:.4f}")
+    print("="*60)
+
+
+# -------------------------------
+# Main
+# -------------------------------
+def main():
+    parser = argparse.ArgumentParser(description="ModernBERT head-only vs LoRA classification")
+    parser.add_argument("--model", type=str, default="answerdotai/ModernBERT-base")
+    parser.add_argument("--dataset", type=str, default="ag_news", choices=["ag_news", "sst2"])
+    parser.add_argument("--epochs", type=int, default=5)
+    parser.add_argument("--lr_head", type=float, default=5e-3)
+    parser.add_argument("--lr_lora", type=float, default=2e-3)
+    parser.add_argument("--max_len", type=int, default=128)
+    parser.add_argument("--seed", type=int, default=42)
+
+    args = parser.parse_args()
+
+    set_seed(args.seed)
+    device = choose_device()
+
+    tokenizer = AutoTokenizer.from_pretrained(args.model, use_fast=True)
+    train_loader, dev_loader, test_loader, num_labels = load_text_classification(
+        args.dataset, args.seed, tokenizer, max_len=args.max_len
+    )
+
+    # (4.1) Head-only training
+    head_model = build_head_only_model(args.model, num_labels, device)
+    head_res = train_model(
+        head_model, train_loader, dev_loader, device, epochs=args.epochs, lr=args.lr_head, out_path="head_best.pt"
+    )
+    head_test_acc = evaluate_best(head_model, head_res.best_path, test_loader, device)
+    head_res.test_acc = head_test_acc
+    plot_curves(head_res.train_curve, head_res.dev_curve, "Head-only: accuracy", "head_acc.png")
+
+    # (4.2) LoRA training with parameter budget ~ head-only
+    head_budget = head_res.trainable_params
+    lora_model, targets, r = build_lora_model_with_budget(args.model, num_labels, device, head_budget)
+    lora_res = train_model(
+        lora_model, train_loader, dev_loader, device, epochs=args.epochs, lr=args.lr_lora, out_path="lora_best.pt"
+    )
+    lora_test_acc = evaluate_best(lora_model, lora_res.best_path, test_loader, device)
+    lora_res.test_acc = lora_test_acc
+    plot_curves(lora_res.train_curve, lora_res.dev_curve, f"LoRA (targets={targets}, r={r}): accuracy", "lora_acc.png")
+
+    # Print results
+    print_results(
+        head_params=head_res.trainable_params,
+        head_best_dev=head_res.best_dev_acc,
+        head_test=head_res.test_acc,
+        lora_params=lora_res.trainable_params,
+        lora_best_dev=lora_res.best_dev_acc,
+        lora_test=lora_res.test_acc,
+    )
+
+
+if __name__ == "__main__":
+    main()

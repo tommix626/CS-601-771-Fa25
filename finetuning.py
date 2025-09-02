@@ -3,7 +3,7 @@
 Empirical: Building a Head-Tuned Classifier and a LoRA Classifier on ModernBERT
 
 What this script does (no interpretation prints):
-1) Loads a text classification dataset (default: AG News).
+1) Loads the StrategyQA dataset from Hugging Face and builds train/dev/test splits.
 2) Trains two models:
    (4.1) HEAD-ONLY: Freeze ModernBERT and train only the classification head.
    (4.2) LoRA: Freeze ModernBERT + classifier; add LoRA on a small subset of Linear layers.
@@ -82,27 +82,30 @@ def plot_curves(train_acc: List[float], dev_acc: List[float], title: str, outfil
 # -------------------------------
 def load_text_classification(dataset_name: str, seed: int, tokenizer, max_len: int = 128):
     """
-    Loads dataset (default: ag_news) and creates train/dev/test splits.
+    Loads StrategyQA (default) and creates train/dev/test splits.
     """
-    if dataset_name == "ag_news":
-        ds = load_dataset("ag_news")
-        num_labels = 4
-        text_col = "text"
-        label_col = "label"
-        # Split train into train/dev
-        split = ds["train"].train_test_split(test_size=0.2, seed=seed)
-        train_ds, dev_ds = split["train"], split["test"]
-        test_ds = ds["test"]
-    elif dataset_name == "sst2":
-        ds = load_dataset("glue", "sst2")
+    if dataset_name == "strategyqa":
+        # Note: wics/strategy-qa exposes a single 'test' split; we re-split it into train/dev/test.
+        # Samples have fields like: {'question': str, 'answer': bool, ...}
+        ds = load_dataset("wics/strategy-qa")
+        base = ds["test"]
+        tmp = base.train_test_split(test_size=0.2, seed=seed)  # 80% temp-train, 20% test
+        temp_train, test_ds = tmp["train"], tmp["test"]
+        split2 = temp_train.train_test_split(test_size=0.2, seed=seed)  # 80/20 -> train/dev
+        train_ds, dev_ds = split2["train"], split2["test"]
         num_labels = 2
-        text_col = "sentence"
-        label_col = "label"
-        split = ds["train"].train_test_split(test_size=0.2, seed=seed)
-        train_ds, dev_ds = split["train"], split["test"]
-        test_ds = ds["validation"]
+        text_col = "question"
+
+        # map boolean answers to {0,1}
+        def _label_map(ex):
+            ex["labels"] = 1 if bool(ex.get("answer", False)) else 0
+            return ex
+
+        train_ds = train_ds.map(_label_map)
+        dev_ds = dev_ds.map(_label_map)
+        test_ds = test_ds.map(_label_map)
     else:
-        raise ValueError("Unsupported dataset. Use --dataset ag_news or --dataset sst2")
+        raise ValueError("Unsupported dataset. Use --dataset strategyqa")
 
     def tokenize_fn(ex):
         enc = tokenizer(
@@ -111,7 +114,7 @@ def load_text_classification(dataset_name: str, seed: int, tokenizer, max_len: i
             padding=False,
             max_length=max_len,
         )
-        enc["labels"] = ex[label_col]
+        # 'labels' already set for StrategyQA above
         return enc
 
     train_ds = train_ds.map(tokenize_fn, batched=True, remove_columns=train_ds.column_names)
@@ -336,9 +339,9 @@ def print_results(
 # Main
 # -------------------------------
 def main():
-    parser = argparse.ArgumentParser(description="ModernBERT head-only vs LoRA classification")
+    parser = argparse.ArgumentParser(description="ModernBERT head-only vs LoRA classification (StrategyQA)")
     parser.add_argument("--model", type=str, default="answerdotai/ModernBERT-base")
-    parser.add_argument("--dataset", type=str, default="ag_news", choices=["ag_news", "sst2"])
+    parser.add_argument("--dataset", type=str, default="strategyqa", choices=["strategyqa"])
     parser.add_argument("--epochs", type=int, default=5)
     parser.add_argument("--lr_head", type=float, default=5e-3)
     parser.add_argument("--lr_lora", type=float, default=2e-3)
@@ -365,7 +368,7 @@ def main():
     )
     head_test_acc = evaluate_best(head_model, head_res.best_path, test_loader, device)
     head_res.test_acc = head_test_acc
-    plot_curves(head_res.train_curve, head_res.dev_curve, "Head-only: accuracy", "head_acc.png")
+    plot_curves(head_res.train_curve, head_res.dev_curve, "Head-only (StrategyQA): accuracy", "plots/head_acc.png")
 
     # (4.2) LoRA training with parameter budget ~ head-only
     print("\n" + "="*60)
@@ -378,7 +381,7 @@ def main():
     )
     lora_test_acc = evaluate_best(lora_model, lora_res.best_path, test_loader, device)
     lora_res.test_acc = lora_test_acc
-    plot_curves(lora_res.train_curve, lora_res.dev_curve, f"LoRA (targets={targets}, r={r}): accuracy", "lora_acc.png")
+    plot_curves(lora_res.train_curve, lora_res.dev_curve, f"LoRA (StrategyQA) (targets={targets}, r={r}): accuracy", "plots/lora_acc.png")
 
     # Print results
     print_results(

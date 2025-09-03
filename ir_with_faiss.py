@@ -52,24 +52,36 @@ def unpack_claims(claim_dict: Dict[Tuple[Any, str], Iterable[float]]) -> Tuple[n
 # ----------------------------
 
 def load_scifact_gold_claim2docs(split: str = "train") -> Dict[Any, Set[Any]]:
+    """
+    Build claim_id -> set(doc_id) from HuggingFace 'allenai/scifact' (claims).
+    Primary source: 'cited_doc_ids' (sequence of int32).
+    Fallback: 'evidence_doc_id' (string; often '' when absent).
+    """
     ds = load_dataset("allenai/scifact", "claims")[split]
     claim2docs: Dict[Any, Set[Any]] = {}
     for row in ds:
         cid = row["id"]
-        ev  = row.get("evidence", {})
-        S: Set[Any] = set()
-        if isinstance(ev, dict):
-            # keys are doc_ids (as str or int depending on source)
-            for doc_id in ev.keys():
-                S.add(int(doc_id) if doc_id.isdigit() else doc_id)
-        elif isinstance(ev, list):
-            # fallback for other formats
-            for e in ev:
-                if isinstance(e, dict) and "doc_id" in e:
-                    S.add(e["doc_id"])
-                elif isinstance(e, (list, tuple)) and len(e) >= 1:
-                    S.add(e[0])
-        claim2docs[cid] = S
+        gold: Set[Any] = set()
+
+        # 1) main signal: all cited doc ids
+        cited = row.get("cited_doc_ids", None)
+        if cited:
+            # ensure ints
+            for d in cited:
+                try:
+                    gold.add(int(d))
+                except Exception:
+                    gold.add(d)
+
+        # 2) fallback: evidence_doc_id (string) if present and non-empty
+        ev_doc = row.get("evidence_doc_id", "")
+        if isinstance(ev_doc, str) and ev_doc.strip():
+            try:
+                gold.add(int(ev_doc))
+            except Exception:
+                gold.add(ev_doc)
+
+        claim2docs[cid] = gold
     return claim2docs
 
 

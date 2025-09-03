@@ -52,17 +52,23 @@ def unpack_claims(claim_dict: Dict[Tuple[Any, str], Iterable[float]]) -> Tuple[n
 # ----------------------------
 
 def load_scifact_gold_claim2docs(split: str = "train") -> Dict[Any, Set[Any]]:
-    ds = load_dataset("allenai/scifact", "claims")
+    ds = load_dataset("allenai/scifact", "claims")[split]
     claim2docs: Dict[Any, Set[Any]] = {}
-    for row in ds[split]:
+    for row in ds:
         cid = row["id"]
-        ev  = row.get("evidence", [])
+        ev  = row.get("evidence", {})
         S: Set[Any] = set()
-        for e in ev:
-            if isinstance(e, dict) and "doc_id" in e:
-                S.add(e["doc_id"])
-            elif isinstance(e, (list, tuple)) and len(e) >= 1:
-                S.add(e[0])
+        if isinstance(ev, dict):
+            # keys are doc_ids (as str or int depending on source)
+            for doc_id in ev.keys():
+                S.add(int(doc_id) if doc_id.isdigit() else doc_id)
+        elif isinstance(ev, list):
+            # fallback for other formats
+            for e in ev:
+                if isinstance(e, dict) and "doc_id" in e:
+                    S.add(e["doc_id"])
+                elif isinstance(e, (list, tuple)) and len(e) >= 1:
+                    S.add(e[0])
         claim2docs[cid] = S
     return claim2docs
 

@@ -256,26 +256,25 @@ def load_strategyqa_mlm_loaders(
     def _mlm_tokenize(ex):
         q = ex[text_col]
         prompt = f"Question: {q} Answer: {mask_tok}"
-        enc = tokenizer(prompt, truncation=True, max_length=max_len)
+        enc = tokenizer(prompt, truncation=True, max_length=max_len, padding=False)
         # build full labels: -100 everywhere except the single [MASK] pos
-        labels = np.full_like(enc["input_ids"], fill_value=-100)
-        # locate the single mask position
-        try:
-            mpos = enc["input_ids"].index(mask_id)
-        except ValueError:
-            # if truncated removed mask (rare), force-add at the end
-            enc = tokenizer(prompt + f" {mask_tok}", truncation=True, max_length=max_len)
-            mpos = enc["input_ids"].index(mask_id)
-            labels = np.full_like(enc["input_ids"], fill_value=-100)
+        input_ids = enc["input_ids"]  # list[int]
+        # ensure the [MASK] token is present (handle rare truncation)
+        if mask_id not in input_ids:
+            prompt2 = prompt + f" {mask_tok}"
+            enc = tokenizer(prompt2, truncation=True, max_length=max_len, padding=False)
+            input_ids = enc["input_ids"]
+        mpos = input_ids.index(mask_id)
+        labels = [-100] * len(input_ids)
         labels[mpos] = yes_id if ex["y"] == 1 else no_id
-        enc["labels"] = labels
+        enc["labels"] = labels  # list[int], not numpy
         return enc
 
     train_mlm = base_train.map(_mlm_tokenize, remove_columns=base_train.column_names)
     dev_mlm   = dev_ds.map(_mlm_tokenize, remove_columns=dev_ds.column_names)
     test_mlm  = test_ds.map(_mlm_tokenize, remove_columns=test_ds.column_names)
 
-    collator = DataCollatorWithPadding(tokenizer)
+    collator = DataCollatorWithPadding(tokenizer)  # will pad input_ids/attn_mask/labels; labels padded with -100
     train_loader = DataLoader(train_mlm, batch_size=32, shuffle=True, collate_fn=collator)
     dev_loader   = DataLoader(dev_mlm, batch_size=64, shuffle=False, collate_fn=collator)
     test_loader  = DataLoader(test_mlm, batch_size=64, shuffle=False, collate_fn=collator)
@@ -362,16 +361,15 @@ def run_one_epoch_mlm(
         # accuracy: choose between yes/no probs at the [MASK] position
         with torch.no_grad():
             logits = outputs.logits  # [B, T, V]
-            # mask positions are where labels != -100
+            # mask positions are where labels != -100 (exactly one per row)
             mask_pos = (labels != -100).nonzero(as_tuple=False)
-            # one mask per example assumed
             b_ix = mask_pos[:, 0]
             t_ix = mask_pos[:, 1]
             sel = logits[b_ix, t_ix, :]  # [B, V]
             pred_yes = sel[:, yes_id]
             pred_no = sel[:, no_id]
             preds = (pred_yes > pred_no).long()  # yes=1, no=0
-            gold = (labels[mask_pos[:, 0], mask_pos[:, 1]] == yes_id).long()
+            gold = (labels[b_ix, t_ix] == yes_id).long()
             acc = (preds == gold).float().mean().item()
         losses.append(loss.item())
         accs.append(acc)

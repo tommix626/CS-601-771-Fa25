@@ -11,7 +11,7 @@ import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader
 from datasets import load_dataset
-from transformers import AutoTokenizer, AutoModelForSequenceClassification
+from transformers import AutoTokenizer, AutoModelForSequenceClassification, AutoModelForMaskedLM
 from transformers import DataCollatorWithPadding, set_seed
 from peft import LoraConfig, get_peft_model
 import matplotlib.pyplot as plt
@@ -173,6 +173,116 @@ def load_text_classification(dataset_name: str, seed: int, tokenizer, max_len: i
 
 
 # -------------------------------
+# (4.2) StrategyQA as prompted MLM (no classifier head)
+# -------------------------------
+def _pick_single_token_pair_ids(tokenizer: AutoTokenizer) -> Tuple[int, int]:
+    """
+    Prefer a verbalizer pair that is single-token for this tokenizer.
+    Try ('yes','no'), then ('true','false'). Fallback uses the first token of each.
+    """
+    candidates = [("yes", "no"), ("true", "false")]
+    for a, b in candidates:
+        a_ids = tokenizer.encode(a, add_special_tokens=False)
+        b_ids = tokenizer.encode(b, add_special_tokens=False)
+        if len(a_ids) == 1 and len(b_ids) == 1:
+            return a_ids[0], b_ids[0]
+    # fallback: first subtoken
+    a_ids = tokenizer.encode(candidates[0][0], add_special_tokens=False)
+    b_ids = tokenizer.encode(candidates[0][1], add_special_tokens=False)
+    return a_ids[0], b_ids[0]
+
+
+def load_strategyqa_mlm_loaders(
+    seed: int,
+    tokenizer: AutoTokenizer,
+    max_len: int,
+) -> Tuple[DataLoader, DataLoader, DataLoader, int, int]:
+    """
+    Build train/dev/test DataLoaders for prompted MLM:
+        Input:  "Question: {q} Answer: [MASK]"
+        Labels: full-length tensor with -100 except mask position set to verbalizer id.
+    Returns loaders and the (yes_id, no_id) verbalizer ids for evaluation.
+    """
+    # Reuse the same splitting logic as in load_text_classification
+    # but do our own mapping/tokenization for MLM.
+    ds = load_dataset("wics/strategy-qa", trust_remote_code=True)
+    if all(k in ds for k in ("train", "validation", "test")):
+        base_train, dev_ds, test_ds = ds["train"], ds["validation"], ds["test"]
+    elif "train" in ds and "validation" in ds:
+        tmp = ds["train"].train_test_split(test_size=0.2, seed=seed)
+        base_train, test_ds = tmp["train"], tmp["test"]
+        dev_ds = ds["validation"]
+    elif "train" in ds:
+        tmp = ds["train"].train_test_split(test_size=0.2, seed=seed)
+        temp_train, test_ds = tmp["train"], tmp["test"]
+        split2 = temp_train.train_test_split(test_size=0.2, seed=seed)
+        base_train, dev_ds = split2["train"], split2["test"]
+    elif "test" in ds:
+        tmp = ds["test"].train_test_split(test_size=0.2, seed=seed)
+        temp_train, test_ds = tmp["train"], tmp["test"]
+        split2 = temp_train.train_test_split(test_size=0.2, seed=seed)
+        base_train, dev_ds = split2["train"], split2["test"]
+    else:
+        raise RuntimeError("StrategyQA: unexpected split layout.")
+
+    # find a question field
+    text_col = None
+    for c in ["question", "input", "text"]:
+        if c in base_train.features:
+            text_col = c
+            break
+    if text_col is None:
+        raise KeyError("StrategyQA: no question/text field found.")
+
+    def _label_map(ex):
+        if "answer" in ex:
+            ex["y"] = 1 if bool(ex["answer"]) else 0
+        elif "label" in ex:
+            ex["y"] = int(ex["label"])
+        else:
+            raise KeyError("StrategyQA: no 'answer' or 'label'.")
+        return ex
+
+    base_train = base_train.map(_label_map)
+    dev_ds     = dev_ds.map(_label_map)
+    test_ds    = test_ds.map(_label_map)
+
+    yes_id, no_id = _pick_single_token_pair_ids(tokenizer)
+    mask_tok = tokenizer.mask_token
+    if mask_tok is None:
+        raise ValueError("Tokenizer has no [MASK] token; ModernBERT should support masked LM.")
+    mask_id = tokenizer.mask_token_id
+
+    def _mlm_tokenize(ex):
+        q = ex[text_col]
+        prompt = f"Question: {q} Answer: {mask_tok}"
+        enc = tokenizer(prompt, truncation=True, max_length=max_len)
+        # build full labels: -100 everywhere except the single [MASK] pos
+        labels = np.full_like(enc["input_ids"], fill_value=-100)
+        # locate the single mask position
+        try:
+            mpos = enc["input_ids"].index(mask_id)
+        except ValueError:
+            # if truncated removed mask (rare), force-add at the end
+            enc = tokenizer(prompt + f" {mask_tok}", truncation=True, max_length=max_len)
+            mpos = enc["input_ids"].index(mask_id)
+            labels = np.full_like(enc["input_ids"], fill_value=-100)
+        labels[mpos] = yes_id if ex["y"] == 1 else no_id
+        enc["labels"] = labels
+        return enc
+
+    train_mlm = base_train.map(_mlm_tokenize, remove_columns=base_train.column_names)
+    dev_mlm   = dev_ds.map(_mlm_tokenize, remove_columns=dev_ds.column_names)
+    test_mlm  = test_ds.map(_mlm_tokenize, remove_columns=test_ds.column_names)
+
+    collator = DataCollatorWithPadding(tokenizer)
+    train_loader = DataLoader(train_mlm, batch_size=32, shuffle=True, collate_fn=collator)
+    dev_loader   = DataLoader(dev_mlm, batch_size=64, shuffle=False, collate_fn=collator)
+    test_loader  = DataLoader(test_mlm, batch_size=64, shuffle=False, collate_fn=collator)
+    return train_loader, dev_loader, test_loader, yes_id, no_id
+
+
+# -------------------------------
 # Training/Eval Loops
 # -------------------------------
 @dataclass
@@ -188,7 +298,7 @@ class TrainResult:
 # core training loop
 def run_one_epoch(model, loader, device, optimizer=None, desc="Epoch"):
     is_train = optimizer is not None
-    model.train(is_train) 
+    model.train(is_train)
     accs, losses = [], []
     loss_fn = nn.CrossEntropyLoss()
     
@@ -219,6 +329,53 @@ def run_one_epoch(model, loader, device, optimizer=None, desc="Epoch"):
             'acc': f'{current_acc:.4f}'
         })
     
+    return float(np.mean(losses)), float(np.mean(accs))
+
+
+# ----- MLM (prompted) training/eval for LoRA (no classifier head) -----
+def run_one_epoch_mlm(
+    model_mlm: nn.Module,
+    loader: DataLoader,
+    device: torch.device,
+    yes_id: int,
+    no_id: int,
+    optimizer=None,
+    desc="Epoch (MLM)",
+):
+    is_train = optimizer is not None
+    model_mlm.train(is_train)
+    accs, losses = [], []
+    pbar = tqdm(loader, desc=desc, leave=False)
+    for batch in pbar:
+        input_ids = batch["input_ids"].to(device)
+        attention_mask = batch["attention_mask"].to(device)
+        labels = batch["labels"].to(device)  # full-seq MLM labels
+
+        outputs = model_mlm(input_ids=input_ids, attention_mask=attention_mask, labels=labels)
+        loss = outputs.loss
+
+        if is_train:
+            optimizer.zero_grad(set_to_none=True)
+            loss.backward()
+            optimizer.step()
+
+        # accuracy: choose between yes/no probs at the [MASK] position
+        with torch.no_grad():
+            logits = outputs.logits  # [B, T, V]
+            # mask positions are where labels != -100
+            mask_pos = (labels != -100).nonzero(as_tuple=False)
+            # one mask per example assumed
+            b_ix = mask_pos[:, 0]
+            t_ix = mask_pos[:, 1]
+            sel = logits[b_ix, t_ix, :]  # [B, V]
+            pred_yes = sel[:, yes_id]
+            pred_no = sel[:, no_id]
+            preds = (pred_yes > pred_no).long()  # yes=1, no=0
+            gold = (labels[mask_pos[:, 0], mask_pos[:, 1]] == yes_id).long()
+            acc = (preds == gold).float().mean().item()
+        losses.append(loss.item())
+        accs.append(acc)
+        pbar.set_postfix({'loss': f'{np.mean(losses):.4f}', 'acc': f'{np.mean(accs):.4f}'})
     return float(np.mean(losses)), float(np.mean(accs))
 
 
@@ -260,10 +417,60 @@ def train_model(
     )
 
 
+def train_model_mlm(
+    model_mlm: nn.Module,
+    train_loader: DataLoader,
+    dev_loader: DataLoader,
+    device: torch.device,
+    yes_id: int,
+    no_id: int,
+    epochs: int,
+    lr: float,
+    out_path: str,
+) -> TrainResult:
+    optimizer = torch.optim.AdamW([p for p in model_mlm.parameters() if p.requires_grad], lr=lr)
+    train_curve, dev_curve = [], []
+    best_dev, best_epoch = -1.0, -1
+    best_path = out_path
+    for ep in range(1, epochs + 1):
+        _, train_acc = run_one_epoch_mlm(model_mlm, train_loader, device, yes_id, no_id, optimizer=optimizer, desc=f"Epoch {ep}/{epochs} - Train (MLM)")
+        _, dev_acc   = run_one_epoch_mlm(model_mlm, dev_loader,   device, yes_id, no_id, optimizer=None,       desc=f"Epoch {ep}/{epochs} - Val (MLM)")
+        train_curve.append(train_acc)
+        dev_curve.append(dev_acc)
+        print(f"Epoch {ep}: Train Acc = {train_acc:.4f}, Dev Acc = {dev_acc:.4f}")
+        if dev_acc > best_dev:
+            best_dev = dev_acc
+            best_epoch = ep
+            torch.save(model_mlm.state_dict(), best_path)
+            print(f"  -> New best dev accuracy! Saving checkpoint.")
+    return TrainResult(
+        train_curve=train_curve,
+        dev_curve=dev_curve,
+        best_epoch=best_epoch,
+        best_dev_acc=best_dev,
+        best_path=best_path,
+        trainable_params=count_trainable_params(model_mlm),
+    )
+
+
 def evaluate_best(model: nn.Module, ckpt_path: str, test_loader: DataLoader, device: torch.device) -> float:
     state = torch.load(ckpt_path, map_location=device)
     model.load_state_dict(state)
     _, test_acc = run_one_epoch(model, test_loader, device, optimizer=None, desc="Evaluating on test set")
+    return test_acc
+
+
+def evaluate_best_mlm(
+    model_mlm: nn.Module,
+    ckpt_path: str,
+    test_loader: DataLoader,
+    device: torch.device,
+    yes_id: int,
+    no_id: int,
+) -> float:
+    state = torch.load(ckpt_path, map_location=device)
+    model_mlm.load_state_dict(state)
+    _, test_acc = run_one_epoch_mlm(model_mlm, test_loader, device, yes_id, no_id, optimizer=None, desc="Evaluating on test set (MLM)")
     return test_acc
 
 
@@ -323,16 +530,14 @@ def pick_lora_targets_close_to_budget(model: nn.Module, budget_params: int) -> T
     return chosen, r
 
 
-def build_lora_model_with_budget(model_name: str, num_labels: int, device: torch.device, head_budget: int):
+def build_lora_mlm_model_with_budget(model_name: str, device: torch.device, head_budget: int):
     """
-    Freeze base + classifier, add LoRA to a subset of linear layers to match (as close as possible)
-    the number of trainable parameters from head-only training.
+    Build AutoModelForMaskedLM, freeze all weights including lm_head, and inject LoRA
+    into a small subset of Linear modules to match the head-only parameter budget.
     """
-    base = AutoModelForSequenceClassification.from_pretrained(model_name, num_labels=num_labels).to(device)
-    # Freeze everything, including classifier
-    for name, p in base.named_parameters():
+    base = AutoModelForMaskedLM.from_pretrained(model_name).to(device)
+    for _, p in base.named_parameters():
         p.requires_grad = False
-
     targets, r = pick_lora_targets_close_to_budget(base, budget_params=head_budget)
     lcfg = LoraConfig(
         r=r,
@@ -343,9 +548,9 @@ def build_lora_model_with_budget(model_name: str, num_labels: int, device: torch
         task_type="SEQ_CLS",
     )
     lora_model = get_peft_model(base, lcfg)
-    # Make absolutely sure classifier remains frozen
+    # Ensure lm_head stays frozen
     for name, p in lora_model.named_parameters():
-        if "classifier" in name:
+        if "lm_head" in name:
             p.requires_grad = False
     return lora_model, targets, r
 
@@ -403,6 +608,10 @@ def main():
     train_loader, dev_loader, test_loader, num_labels = load_text_classification(
         args.dataset, args.seed, tokenizer, max_len=args.max_len
     )
+    # Build parallel MLM dataloaders for LoRA (no classifier head)
+    mlm_train_loader, mlm_dev_loader, mlm_test_loader, yes_id, no_id = load_strategyqa_mlm_loaders(
+        seed=args.seed, tokenizer=tokenizer, max_len=args.max_len
+    )
 
     # (4.1) Head-only training
     print("\n" + "="*60)
@@ -416,18 +625,19 @@ def main():
     head_res.test_acc = head_test_acc
     plot_curves(head_res.train_curve, head_res.dev_curve, "Head-only (StrategyQA): accuracy", "plots/head_acc.png")
 
-    # (4.2) LoRA training with parameter budget ~ head-only
+    # (4.2) LoRA training with parameter budget ~ head-only, no classifier head (prompted MLM)
     print("\n" + "="*60)
     print("TRAINING LoRA MODEL")
     print("="*60)
     head_budget = head_res.trainable_params
-    lora_model, targets, r = build_lora_model_with_budget(args.model, num_labels, device, head_budget)
-    lora_res = train_model(
-        lora_model, train_loader, dev_loader, device, epochs=args.epochs, lr=args.lr_lora, out_path="lora_best.pt"
+    lora_model, targets, r = build_lora_mlm_model_with_budget(args.model, device, head_budget)
+    lora_res = train_model_mlm(
+        lora_model, mlm_train_loader, mlm_dev_loader, device, yes_id, no_id,
+        epochs=args.epochs, lr=args.lr_lora, out_path="lora_best.pt"
     )
-    lora_test_acc = evaluate_best(lora_model, lora_res.best_path, test_loader, device)
+    lora_test_acc = evaluate_best_mlm(lora_model, lora_res.best_path, mlm_test_loader, device, yes_id, no_id)
     lora_res.test_acc = lora_test_acc
-    plot_curves(lora_res.train_curve, lora_res.dev_curve, f"LoRA (StrategyQA) (targets={targets}, r={r}): accuracy", "plots/lora_acc.png")
+    plot_curves(lora_res.train_curve, lora_res.dev_curve, f"LoRA-MLM (StrategyQA) (targets={targets}, r={r}): accuracy", "plots/lora_acc.png")
 
     # Print results
     head_classifier_cost = count_classifier_head_params(head_model)

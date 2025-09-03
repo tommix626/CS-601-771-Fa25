@@ -274,10 +274,37 @@ def load_strategyqa_mlm_loaders(
     dev_mlm   = dev_ds.map(_mlm_tokenize, remove_columns=dev_ds.column_names)
     test_mlm  = test_ds.map(_mlm_tokenize, remove_columns=test_ds.column_names)
 
-    collator = DataCollatorWithPadding(tokenizer)  # will pad input_ids/attn_mask/labels; labels padded with -100
-    train_loader = DataLoader(train_mlm, batch_size=32, shuffle=True, collate_fn=collator)
-    dev_loader   = DataLoader(dev_mlm, batch_size=64, shuffle=False, collate_fn=collator)
-    test_loader  = DataLoader(test_mlm, batch_size=64, shuffle=False, collate_fn=collator)
+    # Custom collator that properly handles MLM labels
+    def mlm_collate_fn(batch):
+        # Extract input_ids, attention_mask, and labels
+        input_ids = [item["input_ids"] for item in batch]
+        attention_mask = [item["attention_mask"] for item in batch]
+        labels = [item["labels"] for item in batch]
+        
+        # Pad sequences to the same length
+        max_len = max(len(seq) for seq in input_ids)
+        
+        # Pad input_ids and attention_mask
+        padded_input_ids = []
+        padded_attention_mask = []
+        padded_labels = []
+        
+        for i, (ids, attn, lbls) in enumerate(zip(input_ids, attention_mask, labels)):
+            # Pad with tokenizer pad_token_id
+            pad_len = max_len - len(ids)
+            padded_input_ids.append(ids + [tokenizer.pad_token_id] * pad_len)
+            padded_attention_mask.append(attn + [0] * pad_len)
+            padded_labels.append(lbls + [-100] * pad_len)
+        
+        return {
+            "input_ids": torch.tensor(padded_input_ids),
+            "attention_mask": torch.tensor(padded_attention_mask),
+            "labels": torch.tensor(padded_labels)
+        }
+    
+    train_loader = DataLoader(train_mlm, batch_size=32, shuffle=True, collate_fn=mlm_collate_fn)
+    dev_loader   = DataLoader(dev_mlm, batch_size=64, shuffle=False, collate_fn=mlm_collate_fn)
+    test_loader  = DataLoader(test_mlm, batch_size=64, shuffle=False, collate_fn=mlm_collate_fn)
     return train_loader, dev_loader, test_loader, yes_id, no_id
 
 

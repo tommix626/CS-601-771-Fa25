@@ -283,14 +283,6 @@ def print_ppl_summary(ppl_results: Dict[str, float], paragraph: str, shuffled_pr
     print(f"Original:     tokens={ppl_results['orig_tokens']}, total NLL={ppl_results['orig_nll']:.2f}, perplexity={ppl_results['orig_ppl']:.3f}")
     print(f"Token-shuf:   tokens={ppl_results['shuf_tokens']}, total NLL={ppl_results['shuf_nll']:.2f}, perplexity={ppl_results['shuf_ppl']:.3f}")
     print(f"Word-shuf:    tokens={ppl_results['word_shuf_tokens']}, total NLL={ppl_results['word_shuf_nll']:.2f}, perplexity={ppl_results['word_shuf_ppl']:.3f}\n")
-    print("Comment:")
-    print("-" * width)
-    print(
-        "Shuffling destroys local syntactic/semantic dependencies the model relies on for next-token prediction. "
-        "Word-level shuffling creates more dramatic coherence destruction than token-level shuffling, resulting in "
-        "progressively higher NLL and perplexity (worse modeling), while the original maintains lower perplexity "
-        "due to coherent context."
-    )
     print("=" * width + "\n")
 
 
@@ -369,13 +361,6 @@ def main():
     temps = [0.0, 0.3, 0.6, 0.9, 1.2, 1.5]
     samples = run_sampling_experiment(model, tokenizer, device, prompt, temps, max_new_tokens=args.max_new_tokens)
     print_sampling_summary(samples, show_text=args.show_text, tokenizer=tokenizer, prompt=prompt)
-
-    # Final note for report
-    print("\n=== Notes ===")
-    print("* Greedy (T=0) tends to be locally probable but can be dull and repetitive.")
-    print("* Moderate temperatures (e.g., T≈0.6–0.9) often balance coherence and diversity.")
-    print("* Very high temperatures (e.g., T≥1.2) increase diversity but risk incoherence and repetition.")
-
 
 if __name__ == "__main__":
     main()

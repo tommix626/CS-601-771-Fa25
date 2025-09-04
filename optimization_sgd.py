@@ -199,14 +199,5 @@ def main():
     fig3.tight_layout()
     fig3.savefig("plots/sgd_maximize.png")
 
-    # ----- Brief printed interpretation -----
-    print("\n=== Interpretation ===")
-    print("(a) Momentum: Higher momentum (e.g., 0.9) accelerates along consistent gradients, producing longer, more directed steps and potential overshoot/oscillation across level sets; momentum=0 is more direct but slower.")
-    print(f"(b) Weight decay (wd={wd}): Adds an L2 pull toward the origin, effectively shrinking parameters each step. Trajectories dampen sooner and curve more tightly into (0,0), counteracting momentum overshoot.")
-    print("(c) maximize=True on -x^2-y^2: Performs gradient ascent toward the maximum at (0,0). Behavior mirrors (a) qualitatively—momentum speeds approach and may overshoot before settling at the peak.")
-
-    print("\nSaved figures: sgd_momentum.png, sgd_weight_decay.png, sgd_maximize.png")
-
-
 if __name__ == "__main__":
     main()

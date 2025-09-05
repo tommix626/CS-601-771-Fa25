@@ -2,6 +2,8 @@
 Empirical: Measuring Perplexity and Sampling Strategies with DistilGPT2
 """
 import argparse
+import json
+import os
 import random
 import textwrap
 from dataclasses import dataclass
@@ -222,6 +224,59 @@ def wrap_print(title: str, content: str, width: int = 100):
     print("=" * width + "\n")
 
 
+def save_recorded_data(output_dir: str, original_paragraph: str, token_shuffled_paragraph: str, 
+                      word_shuffled_paragraph: str, samples: List[SampleStats], 
+                      ppl_results: Dict[str, float], args: argparse.Namespace):
+    """Save all recorded data to files for analysis."""
+    os.makedirs(output_dir, exist_ok=True)
+    
+    # Save paragraphs
+    with open(os.path.join(output_dir, "original_paragraph.txt"), "w", encoding="utf-8") as f:
+        f.write(original_paragraph)
+    
+    with open(os.path.join(output_dir, "token_shuffled_paragraph.txt"), "w", encoding="utf-8") as f:
+        f.write(token_shuffled_paragraph)
+    
+    with open(os.path.join(output_dir, "word_shuffled_paragraph.txt"), "w", encoding="utf-8") as f:
+        f.write(word_shuffled_paragraph)
+    
+    # Save generated samples
+    samples_data = []
+    for i, sample in enumerate(samples):
+        sample_data = {
+            "sample_id": i,
+            "temperature": sample.temperature,
+            "greedy": sample.greedy,
+            "text": sample.text,
+            "distinct1": sample.distinct1,
+            "distinct2": sample.distinct2,
+            "repetition": sample.repetition,
+            "avg_logprob": sample.avg_logprob,
+            "tokens": sample.tokens
+        }
+        samples_data.append(sample_data)
+    
+    with open(os.path.join(output_dir, "generated_samples.json"), "w", encoding="utf-8") as f:
+        json.dump(samples_data, f, indent=2, ensure_ascii=False)
+    
+    # Save perplexity results
+    with open(os.path.join(output_dir, "perplexity_results.json"), "w", encoding="utf-8") as f:
+        json.dump(ppl_results, f, indent=2)
+    
+    # Save experiment configuration
+    config = {
+        "model_name": args.model_name,
+        "seed": args.seed,
+        "max_new_tokens": args.max_new_tokens,
+        "show_text": args.show_text,
+        "paragraph": args.paragraph
+    }
+    with open(os.path.join(output_dir, "experiment_config.json"), "w", encoding="utf-8") as f:
+        json.dump(config, f, indent=2)
+    
+    print(f"[Info] Recorded data saved to: {output_dir}")
+
+
 # ---------------------------
 # Main Experiment
 # ---------------------------
@@ -322,6 +377,7 @@ def main():
     parser.add_argument("--max_new_tokens", type=int, default=500, help="Continuation length for generation")
     parser.add_argument("--show_text", action="store_true", help="Print full generated texts")
     parser.add_argument("--paragraph", type=str, default=None, help="Custom paragraph for perplexity test")
+    parser.add_argument("--output_dir", type=str, default="experiment_results", help="Directory to save recorded data")
     args = parser.parse_args()
 
     # Seed everything
@@ -345,13 +401,18 @@ def main():
     # (a) Perplexity Analysis
     paragraph = args.paragraph if args.paragraph is not None else build_default_paragraph()
     ppl_results = run_perplexity_experiment(model, tokenizer, device, paragraph, seed=args.seed)
-    # For a quick "shuffled preview", decode the shuffled ids first 40 tokens to visualize the effect
+    
+    # Generate full shuffled paragraphs for recording
     orig_ids, _ = tokenize(paragraph, tokenizer, device)
     shuf_ids = shuffle_tokens(orig_ids, seed=args.seed)
-    shuf_preview_text = decode(shuf_ids[:, : min(40, shuf_ids.size(1))], tokenizer)
+    token_shuffled_paragraph = decode(shuf_ids, tokenizer)
     
-    # Generate word-shuffled preview
+    # Generate word-shuffled paragraph
     word_shuf_ids, _ = shuffle_words(paragraph, tokenizer, device, seed=args.seed)
+    word_shuffled_paragraph = decode(word_shuf_ids, tokenizer)
+    
+    # For preview display, show first 40 tokens
+    shuf_preview_text = decode(shuf_ids[:, : min(40, shuf_ids.size(1))], tokenizer)
     word_shuf_preview_text = decode(word_shuf_ids[:, : min(40, word_shuf_ids.size(1))], tokenizer)
     
     print_ppl_summary(ppl_results, paragraph, shuf_preview_text, word_shuf_preview_text)
@@ -361,6 +422,17 @@ def main():
     temps = [0.0, 0.3, 0.6, 0.9, 1.2, 1.5]
     samples = run_sampling_experiment(model, tokenizer, device, prompt, temps, max_new_tokens=args.max_new_tokens)
     print_sampling_summary(samples, show_text=args.show_text, tokenizer=tokenizer, prompt=prompt)
+    
+    # Save all recorded data
+    save_recorded_data(
+        args.output_dir, 
+        paragraph, 
+        token_shuffled_paragraph, 
+        word_shuffled_paragraph, 
+        samples, 
+        ppl_results, 
+        args
+    )
 
 if __name__ == "__main__":
     main()
